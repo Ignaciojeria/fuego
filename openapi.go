@@ -403,7 +403,7 @@ func (openapi *OpenAPI) createSchema(key string, v any) *openapi3.SchemaRef {
 		schemaRef.Value.Description = descriptionable.Description()
 	}
 
-	parseStructTags(reflect.TypeOf(v), schemaRef)
+	parseStructTags(reflect.TypeOf(v), schemaRef, openapi.Generator(), openapi.Description().Components.Schemas)
 
 	openapi.Description().Components.Schemas[key] = schemaRef
 
@@ -422,7 +422,7 @@ func (openapi *OpenAPI) createSchema(key string, v any) *openapi3.SchemaRef {
 //   - min=1 => minLength=1 (for strings)
 //   - max=100 => max=100 (for integers)
 //   - max=100 => maxLength=100 (for strings)
-func parseStructTags(t reflect.Type, schemaRef *openapi3.SchemaRef) {
+func parseStructTags(t reflect.Type, schemaRef *openapi3.SchemaRef, generator *openapi3gen.Generator, schemas openapi3.Schemas) {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
@@ -436,12 +436,31 @@ func parseStructTags(t reflect.Type, schemaRef *openapi3.SchemaRef) {
 
 		if field.Anonymous {
 			fieldType := field.Type
-			parseStructTags(fieldType, schemaRef)
+			if fieldType.Kind() == reflect.Ptr {
+				fieldType = fieldType.Elem()
+			}
+
+			embeddedSchemaRef, err := generator.NewSchemaRefForValue(
+				reflect.New(fieldType).Interface(),
+				schemas,
+			)
+			if err != nil {
+				slog.Error("Error generating schema for embedded field", "field", field.Name, "error", err)
+				continue
+			}
+
+			parseStructTags(fieldType, embeddedSchemaRef, generator, schemas)
+
+			for propName, propSchema := range embeddedSchemaRef.Value.Properties {
+				schemaRef.Value.Properties[propName] = propSchema
+			}
+			schemaRef.Value.Required = append(schemaRef.Value.Required, embeddedSchemaRef.Value.Required...)
+
 			continue
 		}
 
 		jsonFieldName := field.Tag.Get("json")
-		jsonFieldName = strings.Split(jsonFieldName, ",")[0] // remove omitempty, etc
+		jsonFieldName = strings.Split(jsonFieldName, ",")[0]
 		if jsonFieldName == "-" {
 			continue
 		}
@@ -451,9 +470,23 @@ func parseStructTags(t reflect.Type, schemaRef *openapi3.SchemaRef) {
 
 		property := schemaRef.Value.Properties[jsonFieldName]
 		if property == nil {
-			slog.Warn("Property not found in schema", "property", jsonFieldName)
-			continue
+			if field.Type.Kind() == reflect.Struct {
+				newSchema, err := generator.NewSchemaRefForValue(
+					reflect.New(field.Type).Interface(),
+					schemas,
+				)
+				if err != nil {
+					slog.Error("Error generating schema for nested field", "field", jsonFieldName, "error", err)
+					continue
+				}
+				schemaRef.Value.Properties[jsonFieldName] = newSchema
+				property = newSchema
+			} else {
+				slog.Warn("Property not found in schema", "property", jsonFieldName)
+				continue
+			}
 		}
+
 		propertyCopy := *property
 		propertyValue := *propertyCopy.Value
 
@@ -487,7 +520,6 @@ func parseStructTags(t reflect.Type, schemaRef *openapi3.SchemaRef) {
 					minPtr := float64(min)
 					propertyValue.Min = &minPtr
 				} else if propertyValue.Type.Is(openapi3.TypeString) {
-					//nolint:gosec // disable G115
 					propertyValue.MinLength = uint64(min)
 				}
 			}
@@ -500,7 +532,6 @@ func parseStructTags(t reflect.Type, schemaRef *openapi3.SchemaRef) {
 					maxPtr := float64(max)
 					propertyValue.Max = &maxPtr
 				} else if propertyValue.Type.Is(openapi3.TypeString) {
-					//nolint:gosec // disable G115
 					maxPtr := uint64(max)
 					propertyValue.MaxLength = &maxPtr
 				}
@@ -519,8 +550,11 @@ func parseStructTags(t reflect.Type, schemaRef *openapi3.SchemaRef) {
 			}
 		}
 		propertyCopy.Value = &propertyValue
-
 		schemaRef.Value.Properties[jsonFieldName] = &propertyCopy
+
+		if field.Type.Kind() == reflect.Struct {
+			parseStructTags(field.Type, schemaRef.Value.Properties[jsonFieldName], generator, schemas)
+		}
 	}
 }
 
